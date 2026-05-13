@@ -1,241 +1,183 @@
-import os
-import shutil
 import logging
-from dotenv import load_dotenv
+import os
+from pathlib import Path
 
+from dotenv import load_dotenv
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings          # ← local embeddings
-from langchain_google_genai import ChatGoogleGenerativeAI        # ← Gemini LLM (unchanged)
-from langchain_community.vectorstores import Chroma
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_chroma import Chroma
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough
 
 load_dotenv()
 
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
-# ── Constants ──────────────────────────────────────────────────────────────────
+# ── Paths resolved relative to this file so they are stable regardless
+# of the working directory from which uvicorn is launched.
+_BASE_DIR = Path(__file__).parent
+CHROMA_DIR = str(_BASE_DIR / "chroma_db")
+COLLECTION_NAME = "rag_documents"
 
-CHROMA_DIR    = "./chroma_db"
-UPLOADS_DIR   = "./uploads"
-CHUNK_SIZE    = 500
-CHUNK_OVERLAP = 50
-TOP_K         = 3
+# ── Chunking parameters
+CHUNK_SIZE = 1000
+CHUNK_OVERLAP = 200
+TOP_K = 5
 
-# Best-in-class local embedding model for semantic search.
-# ~90 MB, downloads once to ~/.cache/huggingface/ and runs fully offline after that.
-# 384-dim vectors — smaller than OpenAI's 1536-dim but plenty for RAG retrieval.
-EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-
-# ── Strict RAG prompt ─────────────────────────────────────────────────────────
-
-RAG_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", """You are a precise assistant that answers questions strictly \
-from the provided document context.
-
-CONTEXT:
-{context}
-
-INSTRUCTIONS:
-- Answer using ONLY the information in the context above.
-- If the answer is not found in the context, say exactly: \
-"I don't know — this information isn't in the uploaded document."
-- Do not use your training knowledge to fill gaps.
-- Be concise and direct. Quote the document where helpful."""),
-    ("human", "{question}"),
-])
-
-# ── Module-level singletons ────────────────────────────────────────────────────
-
-_embeddings:  HuggingFaceEmbeddings | None = None
-_vectorstore: Chroma | None                = None
-_chain                                     = None  # (chain, retriever) tuple
+# ── Lazy singletons — initialised once on first use, not at import time.
+_embeddings: HuggingFaceEmbeddings | None = None
+_llm: ChatGoogleGenerativeAI | None = None
 
 
 def _get_embeddings() -> HuggingFaceEmbeddings:
-    """
-    Return a cached HuggingFaceEmbeddings instance.
-
-    model_kwargs  → forces CPU inference (no GPU required)
-    encode_kwargs → normalise vectors so cosine similarity == dot product,
-                    which is what ChromaDB uses internally.
-    First call downloads the model; every subsequent call is instant.
-    """
     global _embeddings
     if _embeddings is None:
-        log.info("Loading local embedding model: %s", EMBEDDING_MODEL)
-        _embeddings = HuggingFaceEmbeddings(
-            model_name=EMBEDDING_MODEL,
-            model_kwargs={"device": "cpu"},
-            encode_kwargs={"normalize_embeddings": True},
-        )
-        log.info("Embedding model loaded successfully.")
+        logger.info("Loading HuggingFace embedding model (all-MiniLM-L6-v2)…")
+        _embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+        logger.info("Embedding model loaded.")
     return _embeddings
 
 
-# ── STEP 1 — LOAD ─────────────────────────────────────────────────────────────
-
-def load_pdf(file_path: str) -> list:
-    """Load a PDF and return a list of Document objects (one per page)."""
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"PDF not found: {file_path}")
-
-    loader = PyPDFLoader(file_path)
-    pages  = loader.load()
-
-    if not pages or all(p.page_content.strip() == "" for p in pages):
-        raise ValueError(
-            "No text could be extracted. "
-            "This may be a scanned/image PDF — OCR support is needed."
+def _get_llm() -> ChatGoogleGenerativeAI:
+    global _llm
+    if _llm is None:
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "GEMINI_API_KEY is not set. Add it to your .env file."
+            )
+        logger.info("Initialising Gemini 2.5 Flash LLM…")
+        _llm = ChatGoogleGenerativeAI(
+            model="gemini-2.5-flash",
+            google_api_key=api_key,
+            temperature=0,
         )
-
-    log.info("Loaded %d pages from %s", len(pages), file_path)
-    return pages
+    return _llm
 
 
-# ── STEP 2 — CHUNK ────────────────────────────────────────────────────────────
-
-def chunk_documents(pages: list) -> list:
-    """Split pages into overlapping chunks for granular retrieval."""
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE,
-        chunk_overlap=CHUNK_OVERLAP,
-        separators=["\n\n", "\n", ". ", " ", ""],
-    )
-    chunks = splitter.split_documents(pages)
-    log.info("Created %d chunks", len(chunks))
-    return chunks
-
-
-# ── STEPS 3 + 4 — EMBED & STORE ──────────────────────────────────────────────
-
-def embed_and_store(chunks: list) -> Chroma:
-    """
-    Vectorise chunks with local HuggingFace embeddings and persist to ChromaDB.
-    Wipes the previous index so each upload starts clean.
-    """
-    global _vectorstore, _chain
-
-    if os.path.exists(CHROMA_DIR):
-        shutil.rmtree(CHROMA_DIR)
-
-    vectorstore = Chroma.from_documents(
-        documents=chunks,
-        embedding=_get_embeddings(),   # ← local, no API call
+def _get_vectorstore() -> Chroma:
+    return Chroma(
+        collection_name=COLLECTION_NAME,
+        embedding_function=_get_embeddings(),
         persist_directory=CHROMA_DIR,
     )
 
-    _vectorstore = vectorstore
-    _chain = None  # invalidate — rebuilt on next query
-    log.info("Stored %d chunks in ChromaDB at %s", len(chunks), CHROMA_DIR)
-    return vectorstore
 
+# ── INDEXING PIPELINE ────────────────────────────────────────────────────────
 
-# ── STEP 5 — BUILD LCEL CHAIN ─────────────────────────────────────────────────
+def index_document(file_path: str, filename: str) -> int:
+    """Load, chunk, embed, and store one PDF. Appends to the existing collection."""
+    logger.info("Indexing '%s'…", filename)
 
-def _format_docs(docs: list) -> str:
-    """Concatenate retrieved chunk texts into a single context block."""
-    return "\n\n---\n\n".join(doc.page_content for doc in docs)
+    loader = PyPDFLoader(file_path)
+    pages = loader.load()
+    logger.info("Loaded %d page(s) from '%s'.", len(pages), filename)
 
-
-def _build_chain(vectorstore: Chroma):
-    """
-    Wire together the LCEL RAG chain:
-        question → retriever (local ChromaDB) → prompt → Gemini LLM → answer
-
-    Only the LLM call hits the network. Embeddings are fully local.
-    """
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise EnvironmentError(
-            "GEMINI_API_KEY is not set. Add it to backend/.env and restart."
-        )
-
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",     # ← updated model name
-        temperature=0,
-        api_key=api_key,              # ← new parameter name in v4.0
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
     )
+    chunks = splitter.split_documents(pages)
+    logger.info("Split into %d chunk(s).", len(chunks))
 
-    retriever = vectorstore.as_retriever(
-        search_type="similarity",
-        search_kwargs={"k": TOP_K},
-    )
+    for chunk in chunks:
+        chunk.metadata["source"] = filename
 
-    chain = (
-        {
-            "context":  retriever | _format_docs,
-            "question": RunnablePassthrough(),
-        }
-        | RAG_PROMPT
-        | llm
-        | StrOutputParser()
-    )
+    vectorstore = _get_vectorstore()
+    ids = [f"{filename}_chunk_{i}" for i in range(len(chunks))]
+    vectorstore.add_documents(documents=chunks, ids=ids)
 
-    return chain, retriever
-
-
-def _get_chain():
-    """Return cached (chain, retriever), rebuilding if vectorstore changed."""
-    global _chain, _vectorstore
-
-    if _vectorstore is None:
-        if os.path.exists(CHROMA_DIR):
-            # Reload persisted DB after a server restart — no re-upload needed
-            log.info("Reloading ChromaDB from disk: %s", CHROMA_DIR)
-            _vectorstore = Chroma(
-                persist_directory=CHROMA_DIR,
-                embedding_function=_get_embeddings(),
-            )
-        else:
-            raise RuntimeError(
-                "No document uploaded yet. "
-                "Please upload a PDF before asking questions."
-            )
-
-    if _chain is None:
-        _chain = _build_chain(_vectorstore)
-
-    return _chain  # (chain, retriever) tuple
-
-
-# ── PUBLIC API — called by main.py ────────────────────────────────────────────
-
-def process_pdf(file_path: str) -> int:
-    """
-    Full indexing pipeline: load → chunk → embed (local) → store.
-    Returns chunk count shown to the user after upload.
-    """
-    pages  = load_pdf(file_path)
-    chunks = chunk_documents(pages)
-    embed_and_store(chunks)
+    logger.info("Stored %d chunk(s) for '%s'.", len(chunks), filename)
     return len(chunks)
 
 
-def query(question: str) -> dict:
-    """
-    Full query pipeline: embed question (local) → retrieve → generate (Gemini).
+# ── LIST DOCUMENTS ───────────────────────────────────────────────────────────
 
-    Returns:
-        { "answer": str, "sources": list[str] }
-    """
-    chain, retriever = _get_chain()
+def list_documents() -> list[dict]:
+    """Return a list of indexed files with their chunk counts."""
+    vectorstore = _get_vectorstore()
+    result = vectorstore.get(include=["metadatas"])
 
-    # Retrieve source chunks for attribution (local vector search)
+    counts: dict[str, int] = {}
+    for meta in result["metadatas"]:
+        source = meta.get("source", "unknown")
+        counts[source] = counts.get(source, 0) + 1
+
+    return [{"filename": name, "chunks": count} for name, count in counts.items()]
+
+
+# ── DELETE DOCUMENT ──────────────────────────────────────────────────────────
+
+def delete_document(filename: str) -> int:
+    """Remove all chunks for one file from ChromaDB. Returns chunks deleted."""
+    vectorstore = _get_vectorstore()
+
+    result = vectorstore.get(
+        where={"source": filename},
+        include=["metadatas"],
+    )
+
+    ids_to_delete = result["ids"]
+    if not ids_to_delete:
+        logger.info("No chunks found for '%s' — nothing to delete.", filename)
+        return 0
+
+    vectorstore.delete(ids=ids_to_delete)
+    logger.info("Deleted %d chunk(s) for '%s'.", len(ids_to_delete), filename)
+    return len(ids_to_delete)
+
+
+# ── QUERY PIPELINE ───────────────────────────────────────────────────────────
+
+def query_rag(question: str) -> dict:
+    """
+    Run the full RAG query pipeline.
+
+    Uses MMR retrieval to reduce redundant context chunks, then calls
+    Gemini 2.5 Flash with an anti-hallucination prompt.
+    """
+    logger.info("RAG query: %r", question[:120])
+
+    vectorstore = _get_vectorstore()
+
+    # MMR retrieval: fetch_k=20 candidates, return k=5 maximally diverse ones.
+    retriever = vectorstore.as_retriever(
+        search_type="mmr",
+        search_kwargs={"k": TOP_K, "fetch_k": 20, "lambda_mult": 0.7},
+    )
+
     source_docs = retriever.invoke(question)
+    logger.info("Retrieved %d source chunk(s).", len(source_docs))
 
-    # Generate grounded answer via Gemini LLM
-    answer = chain.invoke(question)
+    context = "\n\n".join(doc.page_content for doc in source_docs)
 
-    # De-duplicate source texts, preserve order
-    seen    = set()
-    sources = []
-    for doc in source_docs:
-        text = doc.page_content.strip()
-        if text and text not in seen:
-            seen.add(text)
-            sources.append(text)
+    prompt = ChatPromptTemplate.from_messages([
+        (
+            "system",
+            "You are a helpful assistant that answers questions strictly based on "
+            "the provided context.\n"
+            "Use ONLY the information from the context below to answer the question.\n"
+            "If the answer is not in the context, say: "
+            "'I don't know based on the provided documents.'\n"
+            "Do not make up information.\n\n"
+            "Context:\n{context}",
+        ),
+        ("human", "{question}"),
+    ])
 
-    return {"answer": answer.strip(), "sources": sources}
+    chain = prompt | _get_llm() | StrOutputParser()
+    answer = chain.invoke({"context": context, "question": question})
+    logger.info("LLM response generated (%d chars).", len(answer))
+
+    sources = [
+        {
+            "text": doc.page_content[:300],
+            "filename": doc.metadata.get("source", "?"),
+            "page": doc.metadata.get("page", "?"),
+        }
+        for doc in source_docs
+    ]
+
+    return {"answer": answer, "sources": sources}

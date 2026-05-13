@@ -1,176 +1,200 @@
-import os
-import shutil
 import logging
+import os
+import re
+import shutil
+from pathlib import Path
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from rag_engine import process_pdf, query
+from rag_engine import index_document, list_documents, delete_document, query_rag
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
-    datefmt="%H:%M:%S",
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
-# ── App ───────────────────────────────────────────────────────────────────────
+# ── Paths ─────────────────────────────────────────────────────────────────────
+# Resolved relative to this file so the app works regardless of which
+# directory uvicorn is launched from.
+_BASE_DIR = Path(__file__).parent
+UPLOAD_DIR = _BASE_DIR / "uploads"
+UPLOAD_DIR.mkdir(exist_ok=True)
+
+# ── Limits ────────────────────────────────────────────────────────────────────
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024   # 50 MB
+MAX_QUESTION_LEN = 2000               # characters
+
+# ── App setup ─────────────────────────────────────────────────────────────────
 app = FastAPI(
-    title="RAG Chatbot API",
-    description="Upload a PDF, then ask questions grounded in its content.",
-    version="1.0.0",
+    title="Multi-File RAG Chatbot API",
+    description="Upload multiple PDFs and ask questions across all of them.",
+    version="2.0.0",
 )
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
-# The React dev server runs on 5173. Both origins are whitelisted so the app
-# works identically in local dev and inside Docker Compose.
+_raw_origins = os.getenv(
+    "CORS_ORIGINS",
+    "http://localhost:5173,http://localhost:3000",
+)
+_allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",   # Vite dev server
-        "http://localhost:3000",   # fallback / alternative dev port
-        "http://frontend:5173",    # Docker Compose service-name resolution
-    ],
+    allow_origins=_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ── Upload directory ──────────────────────────────────────────────────────────
-UPLOADS_DIR = "./uploads"
-os.makedirs(UPLOADS_DIR, exist_ok=True)
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+_SAFE_FILENAME = re.compile(r"^[\w\-. ]+$")
+
+
+def _safe_filename(name: str) -> str:
+    """
+    Reject filenames that could escape the uploads directory.
+    Allows only word characters, hyphens, dots, and spaces.
+    """
+    # Strip any directory components first
+    name = Path(name).name
+    if not _SAFE_FILENAME.match(name):
+        raise HTTPException(
+            status_code=400,
+            detail="Filename contains invalid characters.",
+        )
+    return name
+
 
 # ── Request / Response models ─────────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
-    question: str
+    question: str = Field(..., min_length=1, max_length=MAX_QUESTION_LEN)
+
 
 class ChatResponse(BaseModel):
     answer: str
-    sources: list[str]
+    sources: list[dict]
 
-class UploadResponse(BaseModel):
-    message: str
+
+class DocumentInfo(BaseModel):
     filename: str
     chunks: int
 
-class HealthResponse(BaseModel):
-    status: str
+
+# ── ROUTES ────────────────────────────────────────────────────────────────────
+
+@app.get("/health", summary="Liveness check")
+async def health():
+    docs = list_documents()
+    return {"status": "ok", "indexed_documents": len(docs)}
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
-
-@app.get("/health", response_model=HealthResponse, tags=["System"])
-def health_check():
-    """
-    Liveness probe used by Docker health checks and Railway.
-    Returns 200 immediately — no dependencies checked.
-    """
-    return {"status": "ok"}
-
-
-@app.post("/upload", response_model=UploadResponse, tags=["Document"])
+@app.post("/upload", summary="Upload and index a PDF")
 async def upload_pdf(file: UploadFile = File(...)):
     """
-    Indexing pipeline:
-        1. Save the uploaded PDF to disk
-        2. Load → chunk → embed → store in ChromaDB
-        3. Return chunk count as confirmation to the frontend
+    Accept a PDF, validate it, write it to disk, and index it into ChromaDB.
 
-    Only PDF files are accepted. The previous index is wiped on each upload
-    (single-document mode — extend later for multi-doc support).
+    Returns 409 if a file with the same name is already indexed.
+    Returns 413 if the file exceeds the 50 MB size limit.
     """
-    # ── Validate file type ────────────────────────────────────────────────────
-    if not file.filename.lower().endswith(".pdf"):
+    # ── Validate content type / extension ─────────────────────────────────
+    filename = _safe_filename(file.filename or "")
+    if not filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are accepted.")
+
+    # ── Duplicate guard ────────────────────────────────────────────────────
+    existing_names = {doc["filename"] for doc in list_documents()}
+    if filename in existing_names:
         raise HTTPException(
-            status_code=400,
-            detail="Only PDF files are supported. Please upload a .pdf file.",
+            status_code=409,
+            detail=f"'{filename}' is already indexed. Delete it first to re-upload.",
         )
 
-    # ── Save to disk ──────────────────────────────────────────────────────────
-    save_path = os.path.join(UPLOADS_DIR, file.filename)
+    # ── Read file content and enforce size limit ───────────────────────────
+    content = await file.read()
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)} MB limit.",
+        )
+
+    # ── Write to disk ──────────────────────────────────────────────────────
+    file_path = UPLOAD_DIR / filename
+    file_path.write_bytes(content)
+    logger.info("Saved upload: %s (%d bytes)", filename, len(content))
+
+    # ── Index into ChromaDB ────────────────────────────────────────────────
     try:
-        with open(save_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        log.info("Saved upload: %s", save_path)
+        chunk_count = index_document(str(file_path), filename)
     except Exception as exc:
-        log.exception("Failed to save uploaded file")
-        raise HTTPException(status_code=500, detail=f"Could not save file: {exc}")
-    finally:
-        await file.close()
+        file_path.unlink(missing_ok=True)
+        logger.exception("Indexing failed for '%s'", filename)
+        raise HTTPException(status_code=500, detail=f"Indexing failed: {exc}") from exc
 
-    # ── Run indexing pipeline ─────────────────────────────────────────────────
-    try:
-        chunk_count = process_pdf(save_path)
-        log.info("Indexed %d chunks from '%s'", chunk_count, file.filename)
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
-    except ValueError as exc:
-        # process_pdf raises ValueError for scanned/image-only PDFs
-        raise HTTPException(status_code=422, detail=str(exc))
-    except EnvironmentError as exc:
-        # Missing GOOGLE_API_KEY
-        raise HTTPException(status_code=500, detail=str(exc))
-    except Exception as exc:
-        log.exception("Indexing failed for '%s'", file.filename)
-        raise HTTPException(status_code=500, detail=f"Indexing failed: {exc}")
-
-    return UploadResponse(
-        message=f"Successfully processed '{file.filename}'",
-        filename=file.filename,
-        chunks=chunk_count,
-    )
+    return {
+        "message": f"Successfully indexed '{filename}' — {chunk_count} chunks added.",
+        "filename": filename,
+        "chunks": chunk_count,
+    }
 
 
-@app.post("/chat", response_model=ChatResponse, tags=["Chat"])
+@app.get("/documents", response_model=list[DocumentInfo], summary="List indexed documents")
+async def get_documents():
+    """Return all currently indexed files with their chunk counts."""
+    return list_documents()
+
+
+@app.delete("/documents/{filename}", summary="Remove a document from the index")
+async def remove_document(filename: str):
+    """
+    Remove all chunks for one file from ChromaDB and delete it from disk.
+    Returns 404 if the file is not found in the index.
+    """
+    filename = _safe_filename(filename)
+
+    deleted_chunks = delete_document(filename)
+    if deleted_chunks == 0:
+        raise HTTPException(
+            status_code=404,
+            detail=f"'{filename}' not found in the index.",
+        )
+
+    (UPLOAD_DIR / filename).unlink(missing_ok=True)
+    logger.info("Removed document '%s' (%d chunks).", filename, deleted_chunks)
+
+    return {
+        "message": f"'{filename}' removed — {deleted_chunks} chunks deleted.",
+        "filename": filename,
+        "chunks_deleted": deleted_chunks,
+    }
+
+
+@app.post("/chat", response_model=ChatResponse, summary="Ask a question across all indexed documents")
 async def chat(request: ChatRequest):
     """
-    Query pipeline:
-        1. Embed the question locally using HuggingFace (all-MiniLM-L6-v2)
-        2. Similarity search → top-3 chunks from ChromaDB (local vector store)
-        3. Assemble prompt with retrieved context
-        4. Gemini 2.0 Flash generates a grounded answer
-
-    The 'sources' field in the response contains the raw text of each
-    retrieved chunk — use these in the frontend for page attribution.
+    Search across all indexed documents and return a grounded answer with sources.
+    Returns 400 if no documents are indexed.
     """
-    # ── Validate input ────────────────────────────────────────────────────────
-    question = request.question.strip()
-    if not question:
+    if not list_documents():
         raise HTTPException(
             status_code=400,
-            detail="Question cannot be empty.",
-        )
-    if len(question) > 2000:
-        raise HTTPException(
-            status_code=400,
-            detail="Question is too long. Please keep it under 2000 characters.",
+            detail="No documents indexed. Upload at least one PDF first.",
         )
 
-    # ── Run query pipeline ────────────────────────────────────────────────────
     try:
-        result = query(question)
-        log.info("Q: %s… → %d source chunks", question[:60], len(result["sources"]))
+        result = query_rag(request.question)
     except RuntimeError as exc:
-        # No PDF uploaded yet — rag_engine raises RuntimeError in this case
-        raise HTTPException(status_code=400, detail=str(exc))
-    except EnvironmentError as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        # Configuration errors (e.g. missing API key) surfaced cleanly
+        logger.error("Configuration error during RAG query: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     except Exception as exc:
-        log.exception("Query failed for question: '%s'", question[:80])
-        raise HTTPException(status_code=500, detail=f"Query failed: {exc}")
+        logger.exception("Unexpected error during RAG query")
+        raise HTTPException(status_code=500, detail=f"Query failed: {exc}") from exc
 
-    return ChatResponse(
-        answer=result["answer"],
-        sources=result["sources"],
-    )
-
-
-# ── Dev entrypoint ────────────────────────────────────────────────────────────
-# Used when running directly: `python main.py`
-# In production / Docker use: `uvicorn main:app --host 0.0.0.0 --port 8000`
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    return ChatResponse(answer=result["answer"], sources=result["sources"])
