@@ -356,8 +356,8 @@ Copy `.env.example` to `.env` and fill in your key. Never commit `.env`.
 
 ## Author
 
-**Mahmoud BELAYEB** — 4th year Software Engineering student
-Building full-stack AI projects for a summer internship in Agentic AI.
+**Mahmoud BELAYEB** — Software Engineering student
+Building full-stack AI project.
 
 [GitHub](https://github.com/BelayebMahmoud) · [LinkedIn](https://www.linkedin.com/in/mahmoud-belayeb/)
 
