@@ -1,37 +1,48 @@
 # Document Q&A — RAG Chatbot
 
-A production-grade Retrieval-Augmented Generation (RAG) chatbot that lets you upload multiple PDFs and ask questions across all of them. Answers are grounded strictly in the documents — no hallucination, no guessing.
+A multi-file Retrieval-Augmented Generation (RAG) chatbot. Upload one or more PDFs, ask questions across all of them, and get answers that are strictly grounded in the documents — with the exact source passages cited.
 
-Built as Portfolio Project #1 for a Full Stack AI internship application.
-
----
-
-## Live Demo
-
-> Coming soon after deployment — link will be added here.
+Built as a portfolio project for a Full Stack AI internship application.
 
 ---
 
 ## What it does
 
-1. **Upload PDFs** — each document is split into chunks, converted to vectors using local embeddings, and stored in ChromaDB (persisted to disk)
-2. **Manage documents** — list all indexed files or delete individual ones without clearing the whole index
-3. **Ask questions** — your question is embedded, matched against all stored chunks via MMR retrieval, and sent to Gemini with only the relevant context
-4. **Get grounded answers** — every response includes the exact source passages and filenames it was based on
+1. **Upload PDFs** — each file is split into chunks, converted to 384-dim vectors using a local transformer model, and stored in ChromaDB on disk
+2. **Manage documents** — list all indexed files (with chunk counts) or delete individual ones without clearing the whole index
+3. **Ask questions** — your question is embedded with the same model, matched against stored chunks via MMR retrieval, and sent to Gemini with only the relevant context
+4. **Get grounded answers** — every response includes the source passages and filenames it was based on; the model is instructed to say "I don't know based on the provided documents." when the answer is not present
+
+---
+
+## What runs locally vs. what requires an API key
+
+This is the most important thing to understand about the architecture:
+
+| Component | Where it runs | API key required? |
+|---|---|---|
+| `all-MiniLM-L6-v2` embeddings | Fully local — downloaded once on first run | No |
+| ChromaDB vector store | Fully local — persisted to `backend/chroma_db/` on disk | No |
+| Google Gemini 2.5 Flash | Remote API call on every chat request | Yes — `GEMINI_API_KEY` |
+
+The embedding model (`all-MiniLM-L6-v2`, ~90 MB) is downloaded automatically from HuggingFace on first run and cached by `sentence-transformers`. After that, all embedding operations — both during indexing and at query time — run entirely offline. No data leaves your machine until you send a question, at which point only the retrieved context chunks and your question are sent to the Gemini API.
+
+Get a free Gemini API key at [aistudio.google.com](https://aistudio.google.com/app/apikey).
 
 ---
 
 ## Tech Stack
 
-| Layer | Technology | Why |
+| Layer | Technology | Version |
 |---|---|---|
-| AI Framework | LangChain v0.3 (LCEL) | Industry standard for RAG pipelines |
-| Embeddings | HuggingFace `all-MiniLM-L6-v2` | Fully local — no API dependency |
-| LLM | Google Gemini 2.5 Flash | Free tier, fast, reliable |
-| Vector Store | ChromaDB | File-based, persistent, no infrastructure needed |
-| Backend | FastAPI + Uvicorn | Async, auto Swagger docs |
-| Frontend | React + Vite | Fast setup, modern tooling |
-| HTTP Client | Axios | Clean API calls from React |
+| Backend framework | FastAPI + Uvicorn | 0.136.1 / 0.46.0 |
+| RAG framework | LangChain (LCEL) | 1.3.0 |
+| Embeddings | HuggingFace `all-MiniLM-L6-v2` via `sentence-transformers` | 5.5.0 |
+| Vector store | ChromaDB (file-persisted) | 1.5.9 |
+| LLM | Google Gemini 2.5 Flash via `langchain-google-genai` | 4.2.2 |
+| PDF loader | pypdf via `langchain-community` | 6.11.0 |
+| Frontend | React 19 + Vite 8 | — |
+| HTTP client | Axios | ^1.15.2 |
 
 ---
 
@@ -40,17 +51,17 @@ Built as Portfolio Project #1 for a Full Stack AI internship application.
 ```
 rag-chatbot/
 ├── backend/
-│   ├── main.py              # FastAPI app — /upload, /chat, /documents, /health routes
-│   ├── rag_engine.py        # Core RAG logic — load, chunk, embed, store, query
+│   ├── main.py              # FastAPI app — routes, input validation, CORS, filename sanitization
+│   ├── rag_engine.py        # All RAG logic — indexing pipeline, query pipeline, document management
 │   ├── requirements.txt     # Python dependencies (fully pinned)
 │   ├── .env.example         # Environment variable template
 │   ├── uploads/             # Uploaded PDFs (auto-created, git-ignored)
 │   └── chroma_db/           # ChromaDB persistent storage (auto-created, git-ignored)
 ├── frontend/
 │   ├── src/
-│   │   ├── App.jsx          # Full chat UI — upload + chat + source attribution
+│   │   ├── App.jsx          # Single-file React app — sidebar + chat UI + source attribution
 │   │   └── main.jsx         # React entry point
-│   ├── vite.config.js       # Vite + proxy config
+│   ├── vite.config.js       # Vite dev server + proxy config
 │   └── package.json
 ├── .gitignore
 └── README.md
@@ -58,28 +69,82 @@ rag-chatbot/
 
 ---
 
+## How each component works
+
+### Embeddings — local, no API cost
+
+`HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")` runs a `sentence-transformers` model entirely in-process, producing 384-dimensional float vectors. The same model instance is used for both indexing and querying — this is a requirement; if you ever swap the embedding model, you must re-index all documents from scratch. The model is initialised lazily on first use to avoid a startup delay.
+
+### Vector store — ChromaDB on disk
+
+ChromaDB persists to `backend/chroma_db/` with a single collection named `rag_documents`. Chunk IDs follow the pattern `{filename}_chunk_{i}` (e.g. `report.pdf_chunk_0`). This deterministic naming is what makes per-file deletion work: to remove a document, the engine queries for all chunks whose `metadata["source"]` matches the filename and deletes them by ID.
+
+### LLM — Gemini 2.5 Flash via REST API
+
+`ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)`. Temperature 0 means the model always picks the highest-probability token — responses are deterministic and conservative, which is appropriate for a document Q&A task. A missing `GEMINI_API_KEY` raises a `RuntimeError` at first use and surfaces as an HTTP 500.
+
+### Prompt — strictly grounded, no free-form generation
+
+The system prompt instructs the model to answer using only the provided context and to respond "I don't know based on the provided documents." if the answer is absent. There is no fallback to the model's training data. The exact prompt lives in `rag_engine.py:query_rag`.
+
+---
+
+## Chunking and Retrieval Strategy
+
+### Chunking parameters
+
+```python
+CHUNK_SIZE    = 1000  # characters per chunk
+CHUNK_OVERLAP = 200   # characters shared between adjacent chunks
+```
+
+`RecursiveCharacterTextSplitter` splits text at natural boundaries (paragraphs, sentences) before falling back to hard character cuts. A 1000-character chunk is roughly half a page — large enough to preserve a coherent idea, small enough that the top-5 chunks fit comfortably in a Gemini context window. The 200-character overlap prevents a sentence from being split cleanly across two chunks where neither half contains enough context to answer a question about it.
+
+### MMR retrieval vs. plain similarity search
+
+Plain similarity search returns the top-k chunks by cosine distance. If your document repeats the same paragraph or table several times, all k slots get filled by near-duplicate passages — wasting context budget. MMR (Maximal Marginal Relevance) solves this by balancing relevance against diversity.
+
+```python
+# In rag_engine.py:query_rag
+retriever = vectorstore.as_retriever(
+    search_type="mmr",
+    search_kwargs={"k": 5, "fetch_k": 20, "lambda_mult": 0.7},
+)
+```
+
+| Parameter | Value | Meaning |
+|---|---|---|
+| `fetch_k` | 20 | Retrieve the 20 most similar chunks from ChromaDB first |
+| `k` | 5 | From those 20, select 5 that are both relevant and diverse |
+| `lambda_mult` | 0.7 | Weight: 1.0 = pure relevance, 0.0 = pure diversity; 0.7 leans toward relevance |
+
+The 20-candidate pool gives MMR room to pick diverse chunks; returning only 5 to the LLM keeps the prompt tight.
+
+---
+
 ## How RAG works — the two pipelines
 
 ### Indexing pipeline (triggered on PDF upload)
+
 ```
 PDF Upload
-    → PyPDFLoader      — extract text page by page
-    → TextSplitter     — chunk into 1000-char fragments, 200-char overlap
-    → HuggingFace      — convert each chunk to a 384-dim vector (local, no API)
-    → ChromaDB         — persist vectors + text to disk
+    → PyPDFLoader           — extract text page by page (text-layer PDFs only)
+    → RecursiveCharacterTextSplitter  — chunk: 1000 chars, 200 overlap
+    → HuggingFaceEmbeddings — convert each chunk to a 384-dim vector (local, no API)
+    → ChromaDB              — persist vectors + text to backend/chroma_db/
+                              IDs: {filename}_chunk_0, {filename}_chunk_1, …
 ```
 
-### Query pipeline (triggered on every question)
+### Query pipeline (triggered on every chat message)
+
 ```
 User Question
-    → HuggingFace      — embed question (same model, critical)
-    → ChromaDB         — MMR search: fetch 20 candidates → return top 5 diverse chunks
-    → Prompt assembly  — "Answer using ONLY the context below…"
-    → Gemini 2.5 Flash — generate grounded answer
-    → Response         — { answer, sources[] }
+    → HuggingFaceEmbeddings — embed question (same model as indexing — mandatory)
+    → ChromaDB MMR          — fetch 20 candidates, return 5 diverse chunks
+    → Prompt assembly       — "Answer using ONLY the context below…"
+    → Gemini 2.5 Flash API  — generate grounded answer (temperature=0)
+    → Response              — { answer, sources[{text, filename, page}] }
 ```
-
-MMR (Maximal Marginal Relevance) picks chunks that are both relevant to the question and diverse from each other, reducing redundant context sent to the LLM.
 
 ---
 
@@ -91,7 +156,7 @@ MMR (Maximal Marginal Relevance) picks chunks that are both relevant to the ques
 - Node.js 18+
 - A free Gemini API key from [aistudio.google.com](https://aistudio.google.com/app/apikey)
 
----
+> On first run the backend downloads the `all-MiniLM-L6-v2` model (~90 MB) from HuggingFace. This is a one-time download; subsequent starts are fast.
 
 ### Backend
 
@@ -99,7 +164,7 @@ MMR (Maximal Marginal Relevance) picks chunks that are both relevant to the ques
 # 1. Navigate to backend
 cd backend
 
-# 2. Create and activate virtual environment
+# 2. Create and activate a virtual environment
 python -m venv .venv
 
 # Windows
@@ -111,51 +176,44 @@ source .venv/bin/activate
 pip install -r requirements.txt
 
 # 4. Create your environment file
-cp .env.example .env       # Mac/Linux
 copy .env.example .env     # Windows
+cp .env.example .env       # Mac/Linux
 
-# 5. Add your Gemini API key to .env
-GEMINI_API_KEY=your-key-here
+# 5. Open .env and add your Gemini API key
+#    GEMINI_API_KEY=your-key-here
 
 # 6. Start the backend
 uvicorn main:app --reload --port 8000
 ```
 
-Backend is running at → `http://localhost:8000`
-Swagger UI available at → `http://localhost:8000/docs`
-
----
+Backend: `http://localhost:8000`
+Swagger UI: `http://localhost:8000/docs`
 
 ### Frontend
 
 ```bash
-# 1. Navigate to frontend (new terminal)
+# New terminal
 cd frontend
-
-# 2. Install dependencies
 npm install
-
-# 3. Start the dev server
 npm run dev
 ```
 
-Frontend is running at → `http://localhost:5173`
-
----
+Frontend: `http://localhost:5173`
 
 ### Test the full flow
 
 1. Open `http://localhost:5173`
-2. Upload one or more PDFs using the sidebar
-3. Wait for the chunk count confirmation
-4. Ask a question about the documents
-5. See the grounded answer with source passages and filenames
+2. Upload one or more PDFs from the left sidebar (multiple files can be selected at once — they upload sequentially)
+3. Wait for the chunk count confirmation in the sidebar
+4. Type a question and press Enter
+5. The answer appears with the source passages and filenames it was drawn from
 
 ---
 
 ## API Reference
 
 ### `POST /upload`
+
 Upload a PDF for indexing. Max file size: 50 MB.
 
 ```bash
@@ -171,12 +229,19 @@ curl -X POST http://localhost:8000/upload \
 }
 ```
 
-Returns `409` if the file is already indexed, `413` if it exceeds 50 MB.
+| Status | Condition |
+|---|---|
+| `200` | File indexed successfully |
+| `400` | Not a PDF, or filename contains invalid characters |
+| `409` | File already indexed — delete it first to re-upload |
+| `413` | File exceeds 50 MB |
+| `500` | Indexing failed (e.g. corrupted PDF, missing API key) |
 
 ---
 
 ### `GET /documents`
-List all currently indexed documents.
+
+List all currently indexed documents with chunk counts.
 
 ```bash
 curl http://localhost:8000/documents
@@ -192,7 +257,8 @@ curl http://localhost:8000/documents
 ---
 
 ### `DELETE /documents/{filename}`
-Remove a document from the index and delete it from disk.
+
+Remove a document from the index and delete it from disk. Removes all chunks for that file from ChromaDB by matching the `{filename}_chunk_{i}` ID pattern.
 
 ```bash
 curl -X DELETE http://localhost:8000/documents/report.pdf
@@ -206,11 +272,15 @@ curl -X DELETE http://localhost:8000/documents/report.pdf
 }
 ```
 
-Returns `404` if the file is not in the index.
+| Status | Condition |
+|---|---|
+| `200` | Document removed |
+| `404` | Filename not found in the index |
 
 ---
 
 ### `POST /chat`
+
 Ask a question across all indexed documents.
 
 ```bash
@@ -224,7 +294,7 @@ curl -X POST http://localhost:8000/chat \
   "answer": "The document covers...",
   "sources": [
     {
-      "text": "chunk text that was retrieved...",
+      "text": "first 300 characters of the retrieved chunk...",
       "filename": "report.pdf",
       "page": 3
     }
@@ -232,53 +302,21 @@ curl -X POST http://localhost:8000/chat \
 }
 ```
 
-Question length is validated to 1–2000 characters.
+Question length is validated by Pydantic to 1–2000 characters. Returns `400` if no documents are currently indexed. Returns `422` for an invalid request body.
 
 ---
 
 ### `GET /health`
-Liveness check — also verifies ChromaDB connectivity.
+
+Liveness check. Also calls `list_documents()` to verify ChromaDB connectivity.
+
+```bash
+curl http://localhost:8000/health
+```
 
 ```json
 { "status": "ok", "indexed_documents": 2 }
 ```
-
----
-
-## Key RAG Parameters
-
-These parameters control retrieval quality. They live in `rag_engine.py`.
-
-```python
-CHUNK_SIZE    = 1000  # chars per chunk — larger chunks preserve more context
-CHUNK_OVERLAP = 200   # shared chars between adjacent chunks — prevents boundary cuts
-TOP_K         = 5     # diverse chunks returned by MMR and sent to the LLM
-
-# MMR retrieval settings (in query_rag)
-fetch_k       = 20    # candidate pool size before MMR re-ranking
-lambda_mult   = 0.7   # balance between relevance (1.0) and diversity (0.0)
-```
-
----
-
-## Security
-
-| Protection | Implementation |
-|---|---|
-| Path traversal | Filenames are stripped of directory components and validated against `[\w\-. ]+` |
-| Upload size limit | Files exceeding 50 MB are rejected with HTTP 413 before hitting disk |
-| Question length | Pydantic rejects questions outside 1–2000 characters with HTTP 422 |
-| CORS | Allowed origins are read from `CORS_ORIGINS` env var — locked down in production |
-
----
-
-## Known Limitations
-
-| Limitation | Cause | Workaround |
-|---|---|---|
-| Scanned PDFs return no text | Image-only PDF, no text layer | Use OCR pre-processing |
-| Cold start delay (~30s) | Free hosting tier spins down | Expected — first request wakes the server |
-| ChromaDB on free hosting | Some free tiers use ephemeral filesystems | Use a managed vector DB (Pinecone, Weaviate) for persistent cloud deployment |
 
 ---
 
@@ -290,6 +328,29 @@ lambda_mult   = 0.7   # balance between relevance (1.0) and diversity (0.0)
 | `CORS_ORIGINS` | No | `http://localhost:5173,http://localhost:3000` | Comma-separated list of allowed frontend origins |
 
 Copy `.env.example` to `.env` and fill in your key. Never commit `.env`.
+
+---
+
+## Security
+
+| Protection | Implementation |
+|---|---|
+| Path traversal | `Path(name).name` strips directory components; remaining filename is validated against `^[\w\-. ]+$` |
+| Upload size limit | Content is read into memory first; files exceeding 50 MB are rejected with HTTP 413 before touching disk |
+| Question length | Pydantic `Field(min_length=1, max_length=2000)` rejects out-of-range questions with HTTP 422 |
+| CORS | Allowed origins are read from `CORS_ORIGINS` env var — defaults to localhost only; set explicitly in production |
+| Duplicate uploads | Re-uploading the same filename is blocked with HTTP 409 until the existing entry is deleted |
+
+---
+
+## Known Limitations
+
+| Limitation | Cause | Notes |
+|---|---|---|
+| Scanned PDFs return no text | Image-only PDF — no text layer | Pre-process with an OCR tool (e.g. `ocrmypdf`) before uploading |
+| First run is slow | `sentence-transformers` downloads `all-MiniLM-L6-v2` (~90 MB) | One-time cost; subsequent starts load from cache |
+| ChromaDB not suited for cloud free tiers | Many free hosting platforms use ephemeral filesystems — the `chroma_db/` directory is wiped on redeploy | Replace with a managed vector DB (Pinecone, Weaviate) for persistent cloud deployment |
+| Vite proxy gap | `vite.config.js` proxies `/upload`, `/chat`, and `/health` to port 8000, but `App.jsx` hardcodes `const API = "http://localhost:8000"` for all requests including `/documents` — the proxy is effectively bypassed for every call | This works fine in a standard local dev setup where both services are on the same machine; it becomes a problem if you run the frontend against a remote backend |
 
 ---
 
